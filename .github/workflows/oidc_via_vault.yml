@@ -1,0 +1,47 @@
+name: via-vault
+on:
+  push:
+    branches: [main, 'feature/**']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  VAULT_ADDR: https://${{ secrets.EC2_VAULT_IP }}.sslip.io
+
+jobs:
+  aws:
+    runs-on: ubuntu-latest
+    steps:
+      - name: GitHub JWT -> Vault token -> AWS creds
+        run: |
+          set -euo pipefail
+
+          # 1. Xin OIDC token của GitHub với audience dành cho Vault
+          JWT=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=vault-lab" | jq -r .value)
+
+          # 2. Đăng nhập Vault bằng JWT
+          VAULT_TOKEN=$(curl -sS --fail-with-body -X POST "$VAULT_ADDR/v1/auth/jwt/login" \
+            -d "{\"role\":\"gha-lab\",\"jwt\":\"$JWT\"}" | jq -r .auth.client_token)
+          echo "::add-mask::$VAULT_TOKEN"
+
+          # 3. Lấy AWS credentials tạm thời
+          CREDS=$(curl -sS --fail-with-body -H "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR/v1/aws/creds/lab-deploy")
+          AK=$(echo "$CREDS" | jq -r .data.access_key)
+          SK=$(echo "$CREDS" | jq -r .data.secret_key)
+          ST=$(echo "$CREDS" | jq -r '.data.session_token // .data.security_token')
+          for v in "$AK" "$SK" "$ST"; do echo "::add-mask::$v"; done
+
+          {
+            echo "AWS_ACCESS_KEY_ID=$AK"
+            echo "AWS_SECRET_ACCESS_KEY=$SK"
+            echo "AWS_SESSION_TOKEN=$ST"
+            echo "AWS_REGION=ap-southeast-1"
+          } >> "$GITHUB_ENV"
+
+      - run: aws sts get-caller-identity
+      - run: aws s3 ls
